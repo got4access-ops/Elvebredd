@@ -1,8 +1,1 @@
-{
-    "functions": {
-        "api/pets.js": {
-            "maxDuration": 30,
-            "memory": 512
-        }
-    }
-}
+{}
