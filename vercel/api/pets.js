@@ -1,27 +1,58 @@
-// Vercel serverless function that proxies elvebredd's pet values past Cloudflare.
+// Vercel Edge function that returns the elvebredd pet array as JSON.
 //
-// CF blocks Node's default TLS fingerprint, so we use cycletls — a Node wrapper
-// around a Go binary that performs the TLS handshake with Chrome's JA3/JA4
-// fingerprint. CF sees a "real Chrome" connection and lets it through.
-//
-// Endpoint:
-//   GET /api/pets                → JSON pet array (cached 1h)
-//   GET /api/pets?refresh=1      → bust cache, refetch
-//
-// Deploy:
-//   1. `npm install cycletls` in this folder
-//   2. `vercel deploy` (free tier is fine)
-//   3. Roblox executor hits https://<your-project>.vercel.app/api/pets
+// Strategy: try direct fetch (Vercel Edge's TLS sometimes passes CF). If CF
+// challenges it, fall back to fetching the Wayback Machine archive — that
+// always works because archive.org isn't behind Cloudflare.
 
-import initCycleTLS from "cycletls";
+export const config = { runtime: "edge" };
 
-let cache = { ts: 0, body: null };
-const TTL_MS = 60 * 60 * 1000; // 1 hour
+const DIRECT = "https://elvebredd.com/adopt-me-calculator";
+const WAYBACK = "https://web.archive.org/web/2if_/https://elvebredd.com/adopt-me-calculator";
+
+function isCFChallenge(text) {
+    return text.includes("Just a moment")
+        || text.includes("Attention Required")
+        || text.includes("cf-browser-verification");
+}
+
+// If body is the raw RSC stream, it's already a single string. If it's the
+// HTML page with __next_f.push chunks (which is what Wayback returns), stitch
+// the chunks back together with JSON.parse to undo their string-escaping.
+function maybeStitch(body) {
+    if (!body.includes("__next_f")) return body;
+    const out = [];
+    let i = 0;
+    const needle = "self.__next_f.push(";
+    while (true) {
+        const s = body.indexOf(needle, i);
+        if (s < 0) break;
+        let depth = 1, inStr = false, esc = false;
+        let j = s + needle.length;
+        while (j < body.length && depth > 0) {
+            const c = body[j];
+            if (esc) esc = false;
+            else if (c === "\\") esc = true;
+            else if (c === '"') inStr = !inStr;
+            else if (!inStr) {
+                if (c === "(") depth++;
+                else if (c === ")") depth--;
+            }
+            j++;
+        }
+        const inner = body.slice(s + needle.length, j - 1); // [N,"..."]
+        try {
+            const dec = JSON.parse(inner);
+            if (typeof dec[1] === "string") out.push(dec[1]);
+        } catch {}
+        i = j;
+    }
+    return out.join("");
+}
 
 function extractPets(text) {
-    const marker = text.indexOf('"image":"/images/pets/');
-    if (marker < 0) throw new Error("marker not found");
-    const start = text.lastIndexOf("[{", marker);
+    const m = text.indexOf('"image":"/images/pets/');
+    if (m < 0) throw new Error("marker not found");
+    const start = text.lastIndexOf("[{", m);
     let depth = 0, inStr = false, esc = false, end = -1;
     for (let i = start; i < text.length; i++) {
         const c = text[i];
@@ -39,40 +70,62 @@ function extractPets(text) {
     return JSON.parse(text.slice(start, end));
 }
 
-export default async function handler(req, res) {
-    const force = req.query.refresh === "1";
-    if (!force && cache.body && Date.now() - cache.ts < TTL_MS) {
-        res.setHeader("Content-Type", "application/json");
-        res.setHeader("Cache-Control", "public, max-age=300");
-        res.setHeader("X-Cache", "hit");
-        return res.status(200).send(cache.body);
+async function tryFetch(url, headers) {
+    try {
+        const r = await fetch(url, { headers });
+        if (r.status !== 200) return { ok: false, reason: `status ${r.status}` };
+        const text = await r.text();
+        if (isCFChallenge(text)) return { ok: false, reason: "CF challenge" };
+        if (text.length < 1000) return { ok: false, reason: "tiny body" };
+        return { ok: true, text };
+    } catch (e) {
+        return { ok: false, reason: e.message };
+    }
+}
+
+export default async function handler(req) {
+    const tried = [];
+
+    // 1) Direct with RSC:1 — Vercel Edge fetch sometimes passes CF
+    let r = await tryFetch(DIRECT, {
+        "RSC": "1",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+    });
+    tried.push({ source: "direct", ok: r.ok, reason: r.reason });
+
+    // 2) Wayback fallback (always works, but stale)
+    let source = "direct (live)";
+    if (!r.ok) {
+        source = "wayback (snapshot)";
+        r = await tryFetch(WAYBACK, {
+            "User-Agent": "Mozilla/5.0 (compatible; ElvebreddProxy/1.0)",
+        });
+        tried.push({ source: "wayback", ok: r.ok, reason: r.reason });
     }
 
-    let cycleTLS;
+    if (!r.ok) {
+        return new Response(JSON.stringify({ error: "all sources failed", tried }), {
+            status: 502, headers: { "Content-Type": "application/json" },
+        });
+    }
+
     try {
-        cycleTLS = await initCycleTLS();
-        const r = await cycleTLS("https://elvebredd.com/adopt-me-calculator", {
-            ja3: "771,4865-4866-4867-49195-49199-49196-49200-52393-52392-49171-49172-156-157-47-53,0-23-65281-10-11-35-16-5-13-18-51-45-43-27-17513,29-23-24,0",
-            userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        const stitched = maybeStitch(r.text);
+        const pets = extractPets(stitched);
+        return new Response(JSON.stringify(pets), {
+            status: 200,
             headers: {
-                "RSC": "1",
-                "Accept": "*/*",
-                "Accept-Language": "en-US,en;q=0.9",
+                "Content-Type": "application/json",
+                "Cache-Control": "public, s-maxage=3600, stale-while-revalidate=86400",
+                "X-Source": source,
+                "X-Pet-Count": String(pets.length),
             },
-        }, "get");
-
-        if (r.status !== 200) throw new Error(`upstream ${r.status}`);
-        const pets = extractPets(r.body);
-        cache = { ts: Date.now(), body: JSON.stringify(pets) };
-
-        res.setHeader("Content-Type", "application/json");
-        res.setHeader("Cache-Control", "public, max-age=300");
-        res.setHeader("X-Cache", "miss");
-        res.setHeader("X-Pet-Count", String(pets.length));
-        return res.status(200).send(cache.body);
-    } catch (err) {
-        return res.status(500).json({ error: String(err.message || err) });
-    } finally {
-        if (cycleTLS) cycleTLS.exit();
+        });
+    } catch (e) {
+        return new Response(JSON.stringify({ error: e.message, source, tried }), {
+            status: 500, headers: { "Content-Type": "application/json" },
+        });
     }
 }
