@@ -1,0 +1,9 @@
+{
+    "name": "elvebredd-proxy",
+    "version": "1.0.0",
+    "private": true,
+    "type": "module",
+    "dependencies": {
+        "cycletls": "^1.0.26"
+    }
+}
